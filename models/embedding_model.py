@@ -24,7 +24,13 @@ class LajavanessEmbedding:
             self.device = device
             
         # Get optimal dtype for the device
-        self.dtype = get_torch_dtype_for_device(torch.device(self.device))
+        # Always use float32 for CPU to avoid compatibility issues
+        if self.device == "cpu":
+            self.dtype = torch.float32
+            logger.info("Using float32 for CPU to ensure compatibility")
+        else:
+            self.dtype = get_torch_dtype_for_device(torch.device(self.device))
+            
         logger.info(f"Using dtype: {self.dtype} for device: {self.device}")
 
         logger.info(f"Loading embedding model {model_name_or_path} on {self.device}")
@@ -61,12 +67,16 @@ class LajavanessEmbedding:
         """Move model to the specified device"""
         logger.info(f"Moving embedding model from {self.device} to {device}")
         self.device = device
+        
+        # Update dtype if moving to/from CPU
+        if device == "cpu" and self.dtype != torch.float32:
+            logger.info("Switching to float32 for CPU compatibility")
+            self.dtype = torch.float32
+        elif device != "cpu":
+            from utils.device_utils import get_torch_dtype_for_device
+            self.dtype = get_torch_dtype_for_device(torch.device(self.device))
+            
         self.model = self.model.to(device)
-        
-        # Update dtype based on new device
-        from utils.device_utils import get_torch_dtype_for_device
-        self.dtype = get_torch_dtype_for_device(torch.device(self.device))
-        
         return self
 
     def get_embedding(self, text: str) -> np.ndarray:
@@ -83,11 +93,17 @@ class LajavanessEmbedding:
 
             # Generate embeddings using the appropriate dtype
             with torch.no_grad():
-                with torch.autocast(device_type=self.device_type, dtype=self.dtype, enabled=True):
+                # Skip autocast for CPU to avoid dtype issues
+                if self.device == "cpu":
                     outputs = self.model(**inputs)
-                    # Use mean pooling for sentence embedding
                     attention_mask = inputs["attention_mask"]
                     embeddings = self._mean_pooling(outputs.last_hidden_state, attention_mask)
+                else:
+                    # Use autocast for GPU/MPS
+                    with torch.autocast(device_type=self.device_type, dtype=self.dtype, enabled=True):
+                        outputs = self.model(**inputs)
+                        attention_mask = inputs["attention_mask"]
+                        embeddings = self._mean_pooling(outputs.last_hidden_state, attention_mask)
 
             # Normalize and return as numpy array
             normalized_embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
