@@ -31,7 +31,12 @@ class QRMRewardModel:
             
         # Set appropriate dtype for the device if not specified
         if use_torch_dtype is None:
-            self.use_torch_dtype = get_torch_dtype_for_device(torch.device(self.device))
+            # For CPU, always use float32 to avoid compatibility issues
+            if self.device == "cpu":
+                self.use_torch_dtype = torch.float32
+                logger.info("Using float32 for CPU to ensure compatibility")
+            else:
+                self.use_torch_dtype = get_torch_dtype_for_device(torch.device(self.device))
         else:
             self.use_torch_dtype = use_torch_dtype
             
@@ -92,6 +97,11 @@ class QRMRewardModel:
         logger.info(f"Moving QRM reward model from {self.device} to {device}")
         self.device = device
 
+        # Update dtype if needed when changing devices
+        if device == "cpu" and self.use_torch_dtype != torch.float32:
+            logger.info("Switching to float32 for CPU compatibility")
+            self.use_torch_dtype = torch.float32
+
         # Move the model to the specified device
         if hasattr(self, 'model'):
             self.model = self.model.to(device)
@@ -104,18 +114,25 @@ class QRMRewardModel:
             # Format into messages
             messages = self.format_prompt(prompt, response)
 
-            # Apply tokenization and make sure it's on the right device
+            # Apply tokenization
             input_ids = self.tokenizer.apply_chat_template(
                 messages,
                 return_tensors="pt"
             )
 
-            # Double check device before inference
+            # Ensure input is on the right device
             input_ids = input_ids.to(self.device)
 
-            # Get reward prediction with explicit device management
+            # Get reward prediction with proper type handling
             with torch.no_grad():
-                output = self.model(input_ids)
+                # Avoid using autocast for CPU
+                if self.device == "cpu":
+                    output = self.model(input_ids)
+                else:
+                    # Use autocast for GPU
+                    with torch.autocast(device_type=self.device_type(), dtype=self.use_torch_dtype):
+                        output = self.model(input_ids)
+                
                 # Make sure to fetch from the same device
                 reward = output.score.detach().cpu().float().item()
 
@@ -125,3 +142,12 @@ class QRMRewardModel:
             logger.error(f"Error getting reward score: {str(e)}")
             # Return a default value on error
             return 0.0
+            
+    def device_type(self):
+        """Get device type string for autocast"""
+        if self.device == "cuda":
+            return "cuda"
+        elif self.device == "mps":
+            return "mps"
+        else:
+            return "cpu"
