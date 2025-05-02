@@ -19,8 +19,6 @@ class QRMRewardModel:
         use_torch_dtype: Optional[torch.dtype] = None,
         cache_dir: Optional[str] = None,
     ):
-        from utils.device_utils import get_torch_dtype_for_device
-
         self.model_id = model_id
 
         # Set device
@@ -29,18 +27,15 @@ class QRMRewardModel:
         else:
             self.device = device
             
-        # Set appropriate dtype for the device if not specified
+        # Set dtype based on device - this is critical for preventing type mismatches
         if use_torch_dtype is None:
-            # For CPU, always use float32 to avoid compatibility issues
-            if self.device == "cpu":
-                self.use_torch_dtype = torch.float32
-                logger.info("Using float32 for CPU to ensure compatibility")
-            else:
-                self.use_torch_dtype = get_torch_dtype_for_device(torch.device(self.device))
+            # Force float32 for all devices to ensure compatibility
+            # BFloat16 is causing issues with mixed precision operations
+            self.use_torch_dtype = torch.float32
+            logger.info(f"Using torch.float32 for {self.device} to ensure compatibility")
         else:
             self.use_torch_dtype = use_torch_dtype
-            
-        logger.info(f"Using dtype: {self.use_torch_dtype} for device: {self.device}")
+        
         self.cache_dir = cache_dir
 
         # Load the model and tokenizer
@@ -49,24 +44,29 @@ class QRMRewardModel:
             # Load model with optimal settings for the device
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 model_id,
-                torch_dtype=self.use_torch_dtype,
+                torch_dtype=self.use_torch_dtype,  # Force specified dtype
                 trust_remote_code=True,
                 cache_dir=cache_dir
             )
-            # Move model to device after loading
+            
+            # Cast model parameters to float32 to ensure compatibility
+            self.model = self.model.to(dtype=torch.float32)
+            
+            # Move model to device after ensuring dtype
             self.model = self.model.to(self.device)
             self.model.eval()  # Set to evaluation mode
             
-            # Check for CUDA and optimize if available
+            # Check for NVIDIA GPUs and apply optimizations
             if self.device == "cuda" and torch.cuda.is_available():
-                # Apply optimizations for A100
                 gpu_name = torch.cuda.get_device_name(0).lower()
-                if "a100" in gpu_name:
-                    logger.info("Applying optimizations for A100 GPU")
-                    # Flash attention optimization if available
-                    if hasattr(self.model.config, "use_flash_attention_2"):
-                        self.model.config.use_flash_attention_2 = True
-                        logger.info("Enabled Flash Attention 2")
+                logger.info(f"Running on GPU: {gpu_name}")
+                
+                # Check specifically for GH200 or other Hopper architecture GPUs
+                if "gh200" in gpu_name or "hopper" in gpu_name or "h100" in gpu_name:
+                    logger.info("Detected Grace Hopper architecture")
+                    # No autocast or mixed precision for now - using float32 for compatibility
+                elif "a100" in gpu_name:
+                    logger.info("Detected A100 GPU")
             
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_id,
@@ -97,14 +97,10 @@ class QRMRewardModel:
         logger.info(f"Moving QRM reward model from {self.device} to {device}")
         self.device = device
 
-        # Update dtype if needed when changing devices
-        if device == "cpu" and self.use_torch_dtype != torch.float32:
-            logger.info("Switching to float32 for CPU compatibility")
-            self.use_torch_dtype = torch.float32
-
-        # Move the model to the specified device
+        # Always keep the model in float32 for all devices
+        # This avoids dtype issues with mixed precision operations
         if hasattr(self, 'model'):
-            self.model = self.model.to(device)
+            self.model = self.model.to(dtype=torch.float32, device=device)
 
         return self
 
@@ -120,34 +116,20 @@ class QRMRewardModel:
                 return_tensors="pt"
             )
 
-            # Ensure input is on the right device
+            # Move inputs to model's device with explicit float32 cast for inputs
             input_ids = input_ids.to(self.device)
 
-            # Get reward prediction with proper type handling
+            # Get reward prediction without autocast to avoid dtype mismatches
             with torch.no_grad():
-                # Avoid using autocast for CPU
-                if self.device == "cpu":
-                    output = self.model(input_ids)
-                else:
-                    # Use autocast for GPU
-                    with torch.autocast(device_type=self.device_type(), dtype=self.use_torch_dtype):
-                        output = self.model(input_ids)
-                
-                # Make sure to fetch from the same device
+                output = self.model(input_ids)
+                # Convert to CPU float32 for consistency
                 reward = output.score.detach().cpu().float().item()
 
             return reward
 
         except Exception as e:
             logger.error(f"Error getting reward score: {str(e)}")
+            # Add more debug info
+            logger.error(f"Device: {self.device}, Model dtype: {next(self.model.parameters()).dtype}")
             # Return a default value on error
             return 0.0
-            
-    def device_type(self):
-        """Get device type string for autocast"""
-        if self.device == "cuda":
-            return "cuda"
-        elif self.device == "mps":
-            return "mps"
-        else:
-            return "cpu"

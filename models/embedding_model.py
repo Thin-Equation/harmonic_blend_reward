@@ -16,22 +16,14 @@ class LajavanessEmbedding:
         device: Optional[str] = None,
         cache_dir: Optional[str] = None
     ):
-        from utils.device_utils import get_torch_dtype_for_device
-        
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
             
-        # Get optimal dtype for the device
-        # Always use float32 for CPU to avoid compatibility issues
-        if self.device == "cpu":
-            self.dtype = torch.float32
-            logger.info("Using float32 for CPU to ensure compatibility")
-        else:
-            self.dtype = get_torch_dtype_for_device(torch.device(self.device))
-            
-        logger.info(f"Using dtype: {self.dtype} for device: {self.device}")
+        # Always use float32 for all devices to ensure compatibility
+        self.dtype = torch.float32
+        logger.info(f"Using torch.float32 for {self.device} to ensure compatibility")
 
         logger.info(f"Loading embedding model {model_name_or_path} on {self.device}")
 
@@ -44,18 +36,22 @@ class LajavanessEmbedding:
                 cache_dir=cache_dir,
                 torch_dtype=self.dtype
             )
+            
+            # Explicitly ensure model is in float32
+            self.model = self.model.to(dtype=torch.float32)
+            
+            # Move to device after setting dtype
             self.model = self.model.to(self.device)
             self.model.eval()
             
-            # Apply optimizations for A100 if available
+            # Check for NVIDIA GPUs
             if self.device == "cuda" and torch.cuda.is_available():
                 gpu_name = torch.cuda.get_device_name(0).lower()
-                if "a100" in gpu_name:
-                    logger.info("Applying optimizations for A100 GPU")
-                    # Enable memory efficient attention if available (for large embeddings)
-                    if hasattr(self.model.config, "use_flash_attention_2"):
-                        self.model.config.use_flash_attention_2 = True
-                        logger.info("Enabled Flash Attention 2 for embedding model")
+                logger.info(f"Running embedding model on GPU: {gpu_name}")
+                
+                # Check specifically for GH200 or other Hopper architecture
+                if "gh200" in gpu_name or "hopper" in gpu_name or "h100" in gpu_name:
+                    logger.info("Detected Grace Hopper architecture for embedding model")
 
             logger.info("Embedding model loaded successfully")
 
@@ -68,15 +64,10 @@ class LajavanessEmbedding:
         logger.info(f"Moving embedding model from {self.device} to {device}")
         self.device = device
         
-        # Update dtype if moving to/from CPU
-        if device == "cpu" and self.dtype != torch.float32:
-            logger.info("Switching to float32 for CPU compatibility")
-            self.dtype = torch.float32
-        elif device != "cpu":
-            from utils.device_utils import get_torch_dtype_for_device
-            self.dtype = get_torch_dtype_for_device(torch.device(self.device))
+        # Always keep float32 dtype when moving to any device
+        if hasattr(self, 'model'):
+            self.model = self.model.to(dtype=torch.float32, device=device)
             
-        self.model = self.model.to(device)
         return self
 
     def get_embedding(self, text: str) -> np.ndarray:
@@ -91,19 +82,12 @@ class LajavanessEmbedding:
                 return_tensors="pt"
             ).to(self.device)
 
-            # Generate embeddings using the appropriate dtype
+            # Generate embeddings using consistent dtype
             with torch.no_grad():
-                # Skip autocast for CPU to avoid dtype issues
-                if self.device == "cpu":
-                    outputs = self.model(**inputs)
-                    attention_mask = inputs["attention_mask"]
-                    embeddings = self._mean_pooling(outputs.last_hidden_state, attention_mask)
-                else:
-                    # Use autocast for GPU/MPS
-                    with torch.autocast(device_type=self.device_type, dtype=self.dtype, enabled=True):
-                        outputs = self.model(**inputs)
-                        attention_mask = inputs["attention_mask"]
-                        embeddings = self._mean_pooling(outputs.last_hidden_state, attention_mask)
+                # Never use autocast - always use float32 for consistency
+                outputs = self.model(**inputs)
+                attention_mask = inputs["attention_mask"]
+                embeddings = self._mean_pooling(outputs.last_hidden_state, attention_mask)
 
             # Normalize and return as numpy array
             normalized_embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
@@ -111,18 +95,9 @@ class LajavanessEmbedding:
 
         except Exception as e:
             logger.error(f"Error getting embedding: {e}")
+            logger.error(f"Device: {self.device}, Model dtype: {next(self.model.parameters()).dtype}")
             # Return zeros array as fallback
             return np.zeros(1024)  # Assuming 1024-dim embeddings
-
-    @property
-    def device_type(self):
-        """Get the device type string for autocast"""
-        if self.device == "cuda":
-            return "cuda"
-        elif self.device == "mps":
-            return "mps"
-        else:
-            return "cpu"
 
     def _mean_pooling(self, token_embeddings, attention_mask):
         """Mean pooling operation to get sentence embeddings"""
